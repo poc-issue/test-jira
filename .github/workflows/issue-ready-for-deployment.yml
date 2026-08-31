@@ -1,0 +1,242 @@
+name: Issue Ready for Deployment
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  mark-ready-for-deployment:
+    name: Mark linked issues as Ready for Deployment
+    runs-on: ubuntu-latest
+    if: github.event.review.state == 'approved'
+
+    steps:
+      - name: Update linked issues to Ready for Deployment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+
+            // --- Step 1: Get PR details ---
+            const pr = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber
+            });
+
+            const prBody = pr.data.body || '';
+            const prTitle = pr.data.title || '';
+            const branchName = pr.data.head.ref || '';
+
+            // --- Step 2: Check if PR is fully approved ---
+            const reviews = await github.rest.pulls.listReviews({
+              owner, repo, pull_number: prNumber
+            });
+
+            // Get the latest review per user
+            const latestReviews = new Map();
+            for (const review of reviews.data) {
+              if (review.state === 'APPROVED' || review.state === 'CHANGES_REQUESTED') {
+                latestReviews.set(review.user.login, review.state);
+              }
+            }
+
+            const approvals = [...latestReviews.values()].filter(s => s === 'APPROVED').length;
+            const changesRequested = [...latestReviews.values()].filter(s => s === 'CHANGES_REQUESTED').length;
+
+            if (changesRequested > 0) {
+              console.log(`⏭️ PR has ${changesRequested} pending "Changes Requested" review(s). Skipping.`);
+              return;
+            }
+
+            if (approvals === 0) {
+              console.log('⏭️ PR has no approvals yet. Skipping.');
+              return;
+            }
+
+            console.log(`✅ PR has ${approvals} approval(s) and no changes requested.`);
+
+            // --- Step 3: Extract linked issue numbers ---
+            const patterns = [
+              /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*#(\d+)/gi,
+              /(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+https?:\/\/github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/gi
+            ];
+
+            const issueNumbers = new Set();
+
+            for (const text of [prBody, prTitle]) {
+              for (const pattern of patterns) {
+                let match;
+                while ((match = pattern.exec(text)) !== null) {
+                  issueNumbers.add(parseInt(match[1]));
+                }
+              }
+            }
+
+            const branchMatch = branchName.match(/(?:issue|bug|feat|feature)[/-](\d+)/i);
+            if (branchMatch) {
+              issueNumbers.add(parseInt(branchMatch[1]));
+            }
+
+            if (issueNumbers.size === 0) {
+              console.log('ℹ️ No linked issues found.');
+              return;
+            }
+
+            console.log(`🔍 Found linked issues: ${[...issueNumbers].map(n => '#' + n).join(', ')}`);
+
+            // --- Step 4: Get the project from the PR ---
+            const prProjectsQuery = await github.graphql(`
+              query($owner: String!, $repo: String!, $prNumber: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $prNumber) {
+                    projectItems(first: 10) {
+                      nodes {
+                        id
+                        project {
+                          id
+                          number
+                          title
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner, repo, prNumber });
+
+            const projectItems = prProjectsQuery.repository.pullRequest.projectItems.nodes;
+
+            if (projectItems.length === 0) {
+              core.setFailed('❌ This PR is not added to any project.');
+              return;
+            }
+
+            const projectId = projectItems[0].project.id;
+            console.log(`✅ PR is in project: "${projectItems[0].project.title}" (#${projectItems[0].project.number})`);
+
+            // --- Step 5: Get the Status field and "Ready for Deployment" option ---
+            const fieldQuery = await github.graphql(`
+              query($projectId: ID!) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    fields(first: 20) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { projectId });
+
+            const statusField = fieldQuery.node.fields.nodes.find(
+              f => f.name && f.name.toLowerCase() === 'status'
+            );
+
+            if (!statusField) {
+              core.setFailed('❌ No "Status" field found in the project.');
+              return;
+            }
+
+            const readyOption = statusField.options.find(
+              o => o.name.toLowerCase() === 'ready for deployment'
+            );
+
+            if (!readyOption) {
+              const available = statusField.options.map(o => o.name).join(', ');
+              core.setFailed(`❌ No "Ready for Deployment" option found. Available options: ${available}`);
+              return;
+            }
+
+            console.log(`✅ Status field: "${statusField.name}" → Target: "${readyOption.name}"`);
+
+            // --- Step 6: Update each linked issue ---
+            for (const issueNumber of issueNumbers) {
+              try {
+                const issueData = await github.rest.issues.get({
+                  owner, repo, issue_number: issueNumber
+                });
+
+                if (issueData.data.state !== 'open') {
+                  console.log(`⏭️ Issue #${issueNumber} is ${issueData.data.state}, skipping.`);
+                  continue;
+                }
+
+                const issueNodeId = issueData.data.node_id;
+
+                // Find the issue's item in the project
+                const itemQuery = await github.graphql(`
+                  query($projectId: ID!) {
+                    node(id: $projectId) {
+                      ... on ProjectV2 {
+                        items(first: 100) {
+                          nodes {
+                            id
+                            content {
+                              ... on Issue {
+                                id
+                                number
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                `, { projectId });
+
+                const projectItem = itemQuery.node.items.nodes.find(
+                  item => item.content && item.content.number === issueNumber
+                );
+
+                if (!projectItem) {
+                  console.log(`⚠️ Issue #${issueNumber} is not in the project. Adding it now...`);
+
+                  const addResult = await github.graphql(`
+                    mutation($projectId: ID!, $contentId: ID!) {
+                      addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+                        item { id }
+                      }
+                    }
+                  `, { projectId, contentId: issueNodeId });
+
+                  var itemId = addResult.addProjectV2ItemById.item.id;
+                  console.log(`✅ Added issue #${issueNumber} to the project.`);
+                } else {
+                  var itemId = projectItem.id;
+                }
+
+                // Update Status to "Ready for Deployment"
+                await github.graphql(`
+                  mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $projectId
+                      itemId: $itemId
+                      fieldId: $fieldId
+                      value: { singleSelectOptionId: $optionId }
+                    }) {
+                      projectV2Item { id }
+                    }
+                  }
+                `, {
+                  projectId,
+                  itemId,
+                  fieldId: statusField.id,
+                  optionId: readyOption.id
+                });
+
+                console.log(`✅ Issue #${issueNumber} → Status changed to "Ready for Deployment"`);
+
+              } catch (e) {
+                console.log(`❌ Failed to update issue #${issueNumber}: ${e.message}`);
+              }
+            }
